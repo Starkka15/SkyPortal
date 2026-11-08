@@ -1,0 +1,32 @@
+{
+  "name": "skyportal",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Portal of Power for the native Skylanders: Spyro's Adventure port.",
+  "scripts": {
+    "build": "shx rm -rf dist && rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "author": "Starkka15",
+  "license": "GPL-3.0-or-later",
+  "devDependencies": {
+    "@decky/rollup": "^1.0.2",
+    "@decky/ui": "^4.11.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/webpack": "^5.28.0",
+    "rollup": "^4.53.3",
+    "shx": "^0.3.4",
+    "tslib": "^2.7.0",
+    "typescript": "^5.6.2"
+  },
+  "dependencies": {
+    "@decky/api": "^1.1.3",
+    "react-icons": "^5.0.1"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "ignoreMissing": ["react", "react-dom"]
+    }
+  }
+}

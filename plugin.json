@@ -1,0 +1,11 @@
+{
+  "api_version": 1,
+  "name": "SkyPortal",
+  "author": "Starkka15",
+  "flags": ["root"],
+  "publish": {
+    "tags": ["Skylanders", "Portal", "Emulation"],
+    "description": "Portal of Power for the native Skylanders: Spyro's Adventure port: real Wii/PS3 portal passthrough, figures from dumps, and figure dumping.",
+    "image": ""
+  }
+}
