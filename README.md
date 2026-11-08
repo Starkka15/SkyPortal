@@ -17,7 +17,7 @@ A Portal of Power for the native
 
 Only use dumps of toys you own.
 
-> **About this project.** SkyPortal is not mine. It is a basic starting
+> **About this project.** SkyPortal isn't mine to gatekeep. It's a basic starting
 > point to build on (features, fixes, polish), not a finished or maintained product. If
 > you feel up to it, feel free to continue the work; forks and pull requests are welcome.
 
