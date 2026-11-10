@@ -513,6 +513,7 @@ class PortalService:
         self.real = None
         self.real_queue = collections.deque()
         self.real_bits = 0  # last status bits from the real portal
+        self.real_status_time = 0.0  # monotonic time of the last status from it
         self.real_names = {}  # slot -> figure name of a toy on the real portal
         self.real_asked = {}  # slot -> monotonic time we last asked for its id block
         self.real_trace = 0  # non-status packets logged so far
@@ -742,6 +743,7 @@ class PortalService:
                     if bits != self.real_bits:
                         log.info("real portal status %08X", bits)  # trace
                     self.real_bits = bits
+                    self.real_status_time = time.monotonic()
                     self._name_real_toys()
                 elif self.real_trace < 20:
                     self.real_trace += 1
@@ -834,6 +836,16 @@ class PortalService:
                             "figures": sorted(groups[g], key=lambda x: (x["name"].lower(), x["folder"]))})
         return out
 
+    def _library_rel(self, path):
+        """path relative to the library, with / separators, or the full path when it lies
+        outside it. A figure placed from another folder, or restored from an earlier
+        library, may be on another drive, where relpath raises on Windows."""
+        try:
+            rel = os.path.relpath(path, self.library_dir)
+        except ValueError:
+            return path
+        return path if rel.startswith("..") else rel.replace(os.sep, "/")
+
     def _resolve(self, path):
         p = path if os.path.isabs(path) else os.path.join(self.library_dir, path)
         p = os.path.abspath(p)
@@ -887,7 +899,7 @@ class PortalService:
             for s, f in enumerate(self.emu.figures):
                 if f is not None:
                     loaded.append({"slot": s, "name": f.name,
-                                   "file": os.path.relpath(f.path, self.library_dir).replace(os.sep, "/"),
+                                   "file": self._library_rel(f.path),
                                    "id": figure_id(f.data), "kind": figure_name(f.data)})
             real_slots = [s for s in range(SLOTS) if (self.real_bits >> 2 * s) & 1] if self.real else []
             return {
@@ -966,11 +978,14 @@ class PortalService:
             self.dump_sink = collections.deque()
             game_active = self.emu.active
         try:
-            if not game_active:
-                self._dump_cmd(b"\x52")
+            # No reset: after one, the wireless portal sometimes stops seeing a toy that is
+            # already standing on it (status 0 until the toy is lifted and put back). The
+            # service activated the portal when it connected and keeps it active, so it is
+            # only activated here if it has gone quiet.
+            if not game_active and time.monotonic() - self.real_status_time > 1.0:
                 self._dump_cmd(b"\x41\x01")
-                time.sleep(1.5)  # figures read back empty until the portal settles
-            status = self._dump_wait(lambda p: p[0] == 0x53, 1.0, resend=b"\x53")
+                time.sleep(0.5)
+            status = self._dump_status()
             if status is None:
                 raise RuntimeError("the portal sent no status")
             bits = struct.unpack("<I", status[1:5])[0]
@@ -1025,6 +1040,29 @@ class PortalService:
                 for cmd in held:
                     if self.real:
                         self._real_write(cmd)
+
+    def _dump_status(self):
+        """The portal's current status, for which slots hold toys. A reset numbers the toys
+        again from slot 0 (a toy in slot 1 before it can be in slot 0 after), and the sink
+        still holds status from before the reset, so drop what is queued, ask afresh and
+        keep the newest status that arrives."""
+        with self.lock:
+            if self.dump_sink is not None:
+                self.dump_sink.clear()
+        newest = None
+        end = time.monotonic() + 1.0
+        self._dump_cmd(b"\x53")
+        while time.monotonic() < end:
+            with self.lock:
+                sink = self.dump_sink
+                while sink:
+                    p = sink.popleft()
+                    if p[0] == 0x53:
+                        newest = p
+            if newest is not None and time.monotonic() > end - 0.7:
+                break  # waited 0.3 s for anything newer
+            time.sleep(0.01)
+        return newest
 
     def _dump_cmd(self, cmd):
         with self.lock:

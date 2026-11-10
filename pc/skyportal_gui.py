@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFile
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 APP_NAME = "SkyPortal"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 TCP = "127.0.0.1:47150"
 SOCKET = "/tmp/skyportal.sock"
 
@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
             self.resize(980, 640)
 
         # --library DIR (for testing) is used for this run only and not remembered.
-        self.library_dir = library or self.settings.value("library", "") or self._default_library()
+        self.library_dir = os.path.normpath(library or self.settings.value("library", "") or self._default_library())
         self._start_service()
 
         self.timer = QTimer(self)
@@ -481,7 +481,7 @@ class MainWindow(QMainWindow):
         if self.svc:
             self.svc.stop()
             time.sleep(0.2)
-        self.library_dir = d
+        self.library_dir = os.path.normpath(d)
         self.settings.setValue("library", d)
         self.tree.clear()
         self._start_service()
