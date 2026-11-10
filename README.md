@@ -44,8 +44,13 @@ SET_REPORT, replies as interrupt-IN reads.
 
 ## PC (Windows)
 
-Download `SkyPortal.exe` from [Releases](../../releases) and run it before or while the
-game runs. No install and no Python needed.
+From [Releases](../../releases), take either
+
+- `SkyPortal-<version>-Setup.exe`, an installer (per user, no administrator rights, with
+  a Start menu shortcut and an uninstaller), or
+- `SkyPortal-<version>-portable.exe`, a single program that runs from anywhere.
+
+Run SkyPortal before or while the game runs. No Python is needed.
 
 - **Portal:** a plugged-in Wii/PS3 portal is used directly through Windows HID, with no
   driver to install. Its toys show under "On the portal".
@@ -59,11 +64,12 @@ game runs. No install and no Python needed.
 The library is `Documents\Skylanders` by default (File → Change library folder). The game
 connects over TCP 127.0.0.1:47150.
 
-Building the exe (Python 3 with PySide6 and PyInstaller):
+Building both (Python 3 with PySide6 and PyInstaller, and Inno Setup 6 for the
+installer), into `pc/release/`:
 
 ```
 python -m pip install PySide6-Essentials pyinstaller
-python pc/build.py
+python pc/build.py [--iscc <path to ISCC.exe>]
 ```
 
 The window also runs from source on Linux (`python pc/skyportal_gui.py`). A real portal

@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 pc/build/
 pc/dist/
+pc/release/

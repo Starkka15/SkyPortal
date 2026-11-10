@@ -26,7 +26,7 @@ from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QIcon, QPai
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog,  # noqa: E402
                                QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                               QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QToolButton,
+                               QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter, QToolButton,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 APP_NAME = "SkyPortal"
@@ -152,6 +152,10 @@ class PortalRow(QWidget):
         n.setStyleSheet("font-weight: 600;")
         d = QLabel(detail)
         d.setStyleSheet("color: palette(placeholder-text);")
+        # Let the text give way in a narrow window, so the Remove button stays in view.
+        for lab in (n, d):
+            lab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lab.setToolTip(lab.text())
         col.addWidget(n)
         col.addWidget(d)
         lay.addLayout(col, 1)
@@ -251,6 +255,7 @@ class MainWindow(QMainWindow):
         self.portal_list = QListWidget()
         self.portal_list.setSelectionMode(QAbstractItemView.NoSelection)
         self.portal_list.setFocusPolicy(Qt.NoFocus)
+        self.portal_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         ob.addWidget(self.portal_list, 1)
         self.portal_empty = QLabel("Nothing on the portal. Place a figure from the library, "
                                    "or put a toy on a real portal.")
