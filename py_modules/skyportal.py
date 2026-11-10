@@ -18,6 +18,7 @@ Real portal: the 1430:0150 receiver rejects interrupt-OUT transfers, and Linux u
 always uses that endpoint for output reports, so the portal is driven through usbfs
 (usbhid detached, interface claimed): commands as control SET_REPORT(Output),
 replies by interrupt-IN reads from endpoint 0x81.  Needs root (the Decky plugin is).
+On Windows the portal goes through HID (WinHidPortal), which needs no driver change.
 
 Standalone (PC testing): python skyportal.py --library DIR [--tcp 127.0.0.1:47150]
 then type: list | load <file> | remove <slot> | clear | dump | state | quit
@@ -40,8 +41,10 @@ import time
 
 try:
     import fcntl  # Linux: real portal over usbfs
-except ImportError:  # Windows: emulation only
+except ImportError:  # Windows: real portal through HID (WinHidPortal)
     fcntl = None
+if os.name == "nt":
+    import ctypes.wintypes
 
 log = logging.getLogger("skyportal")
 
@@ -317,6 +320,170 @@ class UsbPortal:
             pass
 
 
+class WinHidPortal:
+    """The portal through Windows HID. HidD_SetOutputReport always goes over the control
+    pipe (SET_REPORT), which the receiver accepts, and replies are interrupt-IN input
+    reports read with overlapped ReadFile. No driver change is needed. Reports carry a
+    leading report-id byte (0) that is added and stripped here."""
+
+    _api = None
+
+    @classmethod
+    def _load(cls):
+        if cls._api is not None:
+            return cls._api
+        W = ctypes.wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("d1", W.DWORD), ("d2", W.WORD), ("d3", W.WORD), ("d4", ctypes.c_ubyte * 8)]
+
+        class IFDATA(ctypes.Structure):
+            _fields_ = [("cbSize", W.DWORD), ("guid", GUID), ("flags", W.DWORD),
+                        ("reserved", ctypes.c_void_p)]
+
+        class CAPS(ctypes.Structure):
+            _fields_ = [("Usage", W.USHORT), ("UsagePage", W.USHORT), ("In", W.USHORT),
+                        ("Out", W.USHORT), ("Feat", W.USHORT), ("rest", W.USHORT * 27)]
+
+        class OVERLAPPED(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
+                        ("Offset", W.DWORD), ("OffsetHigh", W.DWORD), ("hEvent", W.HANDLE)]
+
+        sa = ctypes.WinDLL("setupapi", use_last_error=True)
+        hid = ctypes.WinDLL("hid", use_last_error=True)
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        sa.SetupDiGetClassDevsW.restype = W.HANDLE
+        sa.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), W.LPCWSTR, W.HWND, W.DWORD]
+        sa.SetupDiEnumDeviceInterfaces.argtypes = [W.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID),
+                                                   W.DWORD, ctypes.POINTER(IFDATA)]
+        sa.SetupDiGetDeviceInterfaceDetailW.argtypes = [W.HANDLE, ctypes.POINTER(IFDATA), ctypes.c_void_p,
+                                                        W.DWORD, ctypes.POINTER(W.DWORD), ctypes.c_void_p]
+        sa.SetupDiDestroyDeviceInfoList.argtypes = [W.HANDLE]
+        k.CreateFileW.restype = W.HANDLE
+        k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, ctypes.c_void_p, W.DWORD, W.DWORD, W.HANDLE]
+        k.CreateEventW.restype = W.HANDLE
+        k.CreateEventW.argtypes = [ctypes.c_void_p, W.BOOL, W.BOOL, W.LPCWSTR]
+        k.ReadFile.argtypes = [W.HANDLE, ctypes.c_void_p, W.DWORD, ctypes.c_void_p, ctypes.POINTER(OVERLAPPED)]
+        k.GetOverlappedResult.argtypes = [W.HANDLE, ctypes.POINTER(OVERLAPPED), ctypes.POINTER(W.DWORD), W.BOOL]
+        k.WaitForSingleObject.argtypes = [W.HANDLE, W.DWORD]
+        k.WaitForSingleObject.restype = W.DWORD
+        k.CancelIoEx.argtypes = [W.HANDLE, ctypes.c_void_p]
+        k.CloseHandle.argtypes = [W.HANDLE]
+        hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
+        hid.HidD_SetOutputReport.argtypes = [W.HANDLE, ctypes.c_void_p, W.ULONG]
+        hid.HidD_GetPreparsedData.argtypes = [W.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+        hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+        hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(CAPS)]
+        cls._api = dict(sa=sa, hid=hid, k=k, GUID=GUID, IFDATA=IFDATA, CAPS=CAPS, OVERLAPPED=OVERLAPPED)
+        return cls._api
+
+    @classmethod
+    def find(cls):
+        """Device path of a Wii/PS3 portal's HID interface, or None."""
+        a = cls._load()
+        W = ctypes.wintypes
+        g = a["GUID"]()
+        a["hid"].HidD_GetHidGuid(ctypes.byref(g))
+        info = a["sa"].SetupDiGetClassDevsW(ctypes.byref(g), None, None, 0x12)  # PRESENT|INTERFACE
+        if not info or info == W.HANDLE(-1).value:
+            return None
+        try:
+            i = 0
+            while True:
+                d = a["IFDATA"]()
+                d.cbSize = ctypes.sizeof(d)
+                if not a["sa"].SetupDiEnumDeviceInterfaces(info, None, ctypes.byref(g), i, ctypes.byref(d)):
+                    return None
+                i += 1
+                need = W.DWORD()
+                a["sa"].SetupDiGetDeviceInterfaceDetailW(info, ctypes.byref(d), None, 0, ctypes.byref(need), None)
+                if need.value < 8:
+                    continue
+                buf = ctypes.create_string_buffer(need.value)
+                # SP_DEVICE_INTERFACE_DETAIL_DATA_W.cbSize: 8 on 64-bit, 6 on 32-bit.
+                ctypes.cast(buf, ctypes.POINTER(W.DWORD))[0] = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+                if a["sa"].SetupDiGetDeviceInterfaceDetailW(info, ctypes.byref(d), buf, need, None, None):
+                    path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+                    if "vid_1430&pid_0150" in path.lower():
+                        return path
+        finally:
+            a["sa"].SetupDiDestroyDeviceInfoList(info)
+
+    def __init__(self, path):
+        a = self._load()
+        W = ctypes.wintypes
+        self.a = a
+        self.node = path
+        h = a["k"].CreateFileW(path, 0xC0000000, 3, None, 3, 0x40000000, None)  # R/W, share R/W, overlapped
+        if not h or h == W.HANDLE(-1).value:
+            raise OSError(ctypes.get_last_error(), "cannot open the portal")
+        self.h = h
+        pp = ctypes.c_void_p()
+        caps = a["CAPS"]()
+        if a["hid"].HidD_GetPreparsedData(h, ctypes.byref(pp)):
+            a["hid"].HidP_GetCaps(pp, ctypes.byref(caps))
+            a["hid"].HidD_FreePreparsedData(pp)
+        self.in_len = caps.In or 33
+        self.out_len = caps.Out or 33
+        self.ev = a["k"].CreateEventW(None, True, False, None)
+        self.ov = a["OVERLAPPED"]()
+        self.rbuf = ctypes.create_string_buffer(self.in_len)
+        self.pending = False
+        self.closed = False
+
+    def write(self, cmd):
+        buf = ctypes.create_string_buffer(b"\0" + bytes(cmd[:self.out_len - 1]).ljust(self.out_len - 1, b"\0"),
+                                          self.out_len)
+        if not self.a["hid"].HidD_SetOutputReport(self.h, buf, self.out_len):
+            raise OSError(ctypes.get_last_error(), "portal write failed")
+
+    def read(self, timeout_ms=100):
+        """One input report without its report id, None on timeout. Raises OSError when
+        unplugged. A read that times out stays queued for the next call, so no report is
+        lost between calls."""
+        k = self.a["k"]
+        W = ctypes.wintypes
+        if not self.pending:
+            self.ov = self.a["OVERLAPPED"]()
+            self.ov.hEvent = self.ev
+            if not k.ReadFile(self.h, self.rbuf, self.in_len, None, ctypes.byref(self.ov)):
+                err = ctypes.get_last_error()
+                if err != 997:  # ERROR_IO_PENDING
+                    raise OSError(err, "portal read failed")
+            self.pending = True
+        if k.WaitForSingleObject(self.ev, timeout_ms) != 0:
+            return None
+        self.pending = False
+        n = W.DWORD()
+        if not k.GetOverlappedResult(self.h, ctypes.byref(self.ov), ctypes.byref(n), False):
+            raise OSError(ctypes.get_last_error(), "portal read failed")
+        return self.rbuf.raw[1:n.value] if n.value > 1 else None
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        k = self.a["k"]
+        if self.pending:
+            k.CancelIoEx(self.h, None)
+            n = ctypes.wintypes.DWORD()
+            k.GetOverlappedResult(self.h, ctypes.byref(self.ov), ctypes.byref(n), True)
+        k.CloseHandle(self.h)
+        k.CloseHandle(self.ev)
+
+
+def open_real_portal():
+    """(portal, where) for a plugged-in portal, (None, None) if there is none.
+    Raises OSError when one is there but cannot be opened."""
+    if os.name == "nt":
+        path = WinHidPortal.find()
+        return (WinHidPortal(path), "HID") if path else (None, None)
+    if fcntl is None:
+        return None, None
+    node = find_portal_node()
+    return (UsbPortal(node), node) if node else (None, None)
+
+
 # --------------------------------------------------------------------------- service
 
 def _merge_status(older, newer):
@@ -535,29 +702,27 @@ class PortalService:
     # ----- real portal
     def _real_manager(self):
         while self.running:
-            if self.use_real and fcntl is not None and self.real is None:
-                node = find_portal_node()
-                if node:
-                    try:
-                        portal = UsbPortal(node)
-                    except OSError as e:
-                        if self.real_error != str(e):
-                            self.real_error = str(e)
-                            self._event("cannot open portal %s: %s" % (node, e))
-                        portal = None
-                    if portal:
-                        with self.lock:
-                            self.real = portal
-                            self.real_queue.clear()
-                            self.real_error = ""
-                            self._event("real portal connected (%s)" % node)
-                            # Activate it right away: a portal sends status (which toys are
-                            # on it) only after Reset + Activate, and the panel should show
-                            # the toys before the game runs. The game resets it again itself.
-                            self._real_write(b"\x52")
-                            self._real_write(b"\x41\x01")
-                        threading.Thread(target=self._real_reader, args=(portal,), daemon=True,
-                                         name="real-reader").start()
+            if self.use_real and self.real is None:
+                try:
+                    portal, node = open_real_portal()
+                except OSError as e:
+                    if self.real_error != str(e):
+                        self.real_error = str(e)
+                        self._event("cannot open the portal: %s" % e)
+                    portal = None
+                if portal:
+                    with self.lock:
+                        self.real = portal
+                        self.real_queue.clear()
+                        self.real_error = ""
+                        self._event("real portal connected (%s)" % node)
+                        # Activate it right away: a portal sends status (which toys are
+                        # on it) only after Reset + Activate, and the panel should show
+                        # the toys before the game runs. The game resets it again itself.
+                        self._real_write(b"\x52")
+                        self._real_write(b"\x41\x01")
+                    threading.Thread(target=self._real_reader, args=(portal,), daemon=True,
+                                     name="real-reader").start()
             time.sleep(1.0)
 
     def _real_reader(self, portal):
@@ -915,7 +1080,7 @@ def main():
         return
     tcp = a.tcp or ("127.0.0.1:47150" if os.name == "nt" else None)
     svc = PortalService(a.library, state_file=a.state, socket_path=a.socket, tcp=tcp,
-                        use_real=not a.no_real and os.name != "nt")
+                        use_real=not a.no_real)
     svc.start()
     for p in a.load:
         print("placed in slot", svc.load(p))

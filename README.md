@@ -3,7 +3,7 @@
 A Portal of Power for the native
 [Skylanders: Spyro's Adventure port](https://github.com/Starkka15/skylanders-sa-pc), as a
 [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for SteamOS
-(ROG Ally, Steam Deck) and as a plain Python service for a PC.
+(ROG Ally, Steam Deck) and as a desktop app for Windows.
 
 - **Real portal passthrough:** plug in a Wii/PS3 Portal of Power (USB 1430:0150, including
   the wireless receiver) and the game sees it. The quick access panel shows which toys
@@ -42,16 +42,43 @@ The Wii/PS3 receiver rejects interrupt-OUT transfers, which Linux's usbhid alway
 the service detaches usbhid and drives the portal through usbfs: commands as control
 SET_REPORT, replies as interrupt-IN reads.
 
-## PC / command line
+## PC (Windows)
 
-`py_modules/skyportal.py` runs on its own (Python 3, no dependencies):
+Download `SkyPortal.exe` from [Releases](../../releases) and run it before or while the
+game runs. No install and no Python needed.
+
+- **Portal:** a plugged-in Wii/PS3 portal is used directly through Windows HID, with no
+  driver to install. Its toys show under "On the portal".
+- **Library:** figure dumps are listed by element or by folder, with search. Double-click
+  one (or select it and press "Place on portal") to put it on the virtual portal, and use
+  Remove to lift it. Drag dump files onto the window, or use "Add dumps...", to copy them
+  into the library.
+- **Dumping:** "Dump toys on the portal" saves every toy on the real portal to the
+  library's `Dumped` folder.
+
+The library is `Documents\Skylanders` by default (File → Change library folder). The game
+connects over TCP 127.0.0.1:47150.
+
+Building the exe (Python 3 with PySide6 and PyInstaller):
+
+```
+python -m pip install PySide6-Essentials pyinstaller
+python pc/build.py
+```
+
+The window also runs from source on Linux (`python pc/skyportal_gui.py`). A real portal
+there needs root, as with the Decky plugin.
+
+## Command line
+
+`py_modules/skyportal.py` also runs on its own (Python 3, no dependencies):
 
 ```
 python skyportal.py --library <folder of dumps> [--tcp 127.0.0.1:47150] [--load <dump>]
 ```
 
 then type `list`, `load <file> [slot]`, `remove <slot>`, `clear`, `dump`, `state` or
-`quit`. On Windows it emulates the portal only (no real-portal passthrough).
+`quit`. A real portal is used on Windows (HID) and on Linux (usbfs, as root).
 
 ## Building the plugin
 
