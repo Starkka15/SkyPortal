@@ -75,6 +75,34 @@ python pc/build.py [--iscc <path to ISCC.exe>]
 The window also runs from source on Linux (`python pc/skyportal_gui.py`). A real portal
 there needs root, as with the Decky plugin.
 
+## Xbox 360 portal on Linux
+
+The wired Xbox 360 Portal of Power (USB 1430:1f17) works too: it speaks the same commands
+with a `0B 14` header over its interrupt endpoints. The kernel's `xpad` driver claims it;
+SkyPortal detaches it while running and gives it back afterwards. No root is needed when a
+udev rule gives you the device, for example in `/etc/udev/rules.d/70-skylanders.rules`:
+
+```
+SUBSYSTEM=="usb", ATTR{idVendor}=="1430", MODE="0666", TAG+="uaccess"
+```
+
+To start SkyPortal automatically when the game connects (systemd socket activation) and
+stop it a minute after the game exits, install the units in `linux/` (adjust the path in
+`skyportal.service` first):
+
+```
+cp linux/skyportal.socket linux/skyportal.service ~/.config/systemd/user/
+mkdir -p ~/Skylanders ~/.local/state/skyportal
+systemctl --user daemon-reload
+systemctl --user enable --now skyportal.socket
+```
+
+`--exit-when-idle SECONDS` is the option the unit uses for the automatic stop.
+`--follow-real-portal` makes the game see the portal only while a real one is plugged in:
+pulling it out closes the game's link, which the SDK reports to the game as
+`X_ERROR_DEVICE_NOT_CONNECTED` (as a 360 does), and plugging it back in reconnects within
+a second. Figures from dumps then need a real portal to stand on.
+
 ## Command line
 
 `py_modules/skyportal.py` also runs on its own (Python 3, no dependencies):

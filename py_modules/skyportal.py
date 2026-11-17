@@ -3,7 +3,8 @@
 The game (ReXGlue SDK, src/kernel/xam/xam_portal.cpp) connects to this service and
 sends/receives raw portal packets.  This service then
 
-  * passes them to a real Wii/PS3 portal (USB 1430:0150) when one is plugged in,
+  * passes them to a real portal when one is plugged in: Wii/PS3 (USB 1430:0150) or
+    Xbox 360 (USB 1430:1f17),
   * emulates a portal from figure dumps (.sky/.dump/.bin, 1024-byte MIFARE images)
     when none is, and
   * layers "virtual" figures from dumps on top of a real portal, so dumps and real
@@ -18,6 +19,9 @@ Real portal: the 1430:0150 receiver rejects interrupt-OUT transfers, and Linux u
 always uses that endpoint for output reports, so the portal is driven through usbfs
 (usbhid detached, interface claimed): commands as control SET_REPORT(Output),
 replies by interrupt-IN reads from endpoint 0x81.  Needs root (the Decky plugin is).
+The wired Xbox 360 portal (1430:1f17, vendor class, claimed by xpad) speaks the same
+commands with the 0B 14 header on both interrupt endpoints: out on 0x02, in on 0x81.
+It needs only write access to its usbfs node (a udev rule for vendor 1430 gives that).
 On Windows the portal goes through HID (WinHidPortal), which needs no driver change.
 
 Standalone (PC testing): python skyportal.py --library DIR [--tcp 127.0.0.1:47150]
@@ -33,6 +37,7 @@ import json
 import logging
 import os
 import select
+import signal
 import socket
 import struct
 import sys
@@ -255,28 +260,32 @@ USBDEVFS_DISCONNECT = (ord("U") << 8) | 22
 USBDEVFS_CONNECT = (ord("U") << 8) | 23
 
 
+PORTAL_PIDS = {"0150": "wii", "1f17": "xbox360"}
+
+
 def find_portal_node():
-    """/dev/bus/usb/BBB/DDD of a Wii/PS3 portal, or None."""
+    """(/dev/bus/usb/BBB/DDD, kind) of a Wii/PS3 or Xbox 360 portal, or (None, None)."""
     for d in glob.glob("/sys/bus/usb/devices/*"):
         try:
             with open(d + "/idVendor") as f:
                 vid = f.read().strip()
             with open(d + "/idProduct") as f:
                 pid = f.read().strip()
-            if vid == "1430" and pid == "0150":
+            if vid == "1430" and pid in PORTAL_PIDS:
                 with open(d + "/busnum") as f:
                     bus = int(f.read())
                 with open(d + "/devnum") as f:
                     dev = int(f.read())
-                return "/dev/bus/usb/%03d/%03d" % (bus, dev)
+                return "/dev/bus/usb/%03d/%03d" % (bus, dev), PORTAL_PIDS[pid]
         except (OSError, ValueError):
             continue
-    return None
+    return None, None
 
 
 class UsbPortal:
-    def __init__(self, node):
+    def __init__(self, node, kind="wii"):
         self.node = node
+        self.xbox360 = kind == "xbox360"
         self.fd = os.open(node, os.O_RDWR)
         self._ifioctl(USBDEVFS_DISCONNECT)  # take interface 0 away from usbhid
         fcntl.ioctl(self.fd, USBDEVFS_CLAIMINTERFACE, struct.pack("I", 0))
@@ -289,6 +298,12 @@ class UsbPortal:
             pass  # no driver bound / already connected
 
     def write(self, cmd):
+        if self.xbox360:
+            # Interrupt OUT on 0x02, the command behind the 0B 14 header.
+            buf = ctypes.create_string_buffer((HDR360 + bytes(cmd[:30])).ljust(32, b"\0"), 32)
+            fcntl.ioctl(self.fd, USBDEVFS_BULK,
+                        struct.pack("IIIP", 0x02, 32, 500, ctypes.addressof(buf)))
+            return
         buf = ctypes.create_string_buffer(bytes(cmd[:32]).ljust(32, b"\0"), 32)
         fcntl.ioctl(self.fd, USBDEVFS_CONTROL,
                     struct.pack("BBHHHIP", 0x21, 0x09, 0x0200, 0, 32, 500, ctypes.addressof(buf)))
@@ -303,7 +318,11 @@ class UsbPortal:
             if e.errno in (110, 62):  # ETIMEDOUT / ETIME
                 return None
             raise
-        return buf.raw[:n] if isinstance(n, int) and n > 0 else buf.raw
+        pkt = buf.raw[:n] if isinstance(n, int) and n > 0 else buf.raw
+        if self.xbox360:
+            # Replies carry the same 0B 14 header; anything else is not a portal report.
+            return pkt[2:] if pkt[:2] == HDR360 else None
+        return pkt
 
     def close(self):
         if self.closed:
@@ -313,7 +332,7 @@ class UsbPortal:
             fcntl.ioctl(self.fd, USBDEVFS_RELEASEINTERFACE, struct.pack("I", 0))
         except OSError:
             pass
-        self._ifioctl(USBDEVFS_CONNECT)  # give it back to usbhid
+        self._ifioctl(USBDEVFS_CONNECT)  # give it back to usbhid (xpad for the 360 portal)
         try:
             os.close(self.fd)
         except OSError:
@@ -480,8 +499,8 @@ def open_real_portal():
         return (WinHidPortal(path), "HID") if path else (None, None)
     if fcntl is None:
         return None, None
-    node = find_portal_node()
-    return (UsbPortal(node), node) if node else (None, None)
+    node, kind = find_portal_node()
+    return (UsbPortal(node, kind), "%s, %s" % (node, kind)) if node else (None, None)
 
 
 # --------------------------------------------------------------------------- service
@@ -499,7 +518,7 @@ def _merge_status(older, newer):
 
 class PortalService:
     def __init__(self, library_dir, state_file=None, socket_path=None, tcp=None,
-                 file_owner=None, use_real=True):
+                 file_owner=None, use_real=True, listen_fd=None, follow_real=False):
         self.library_dir = os.path.abspath(library_dir)
         self.dump_dir = os.path.join(self.library_dir, "Dumped")
         self.state_file = state_file
@@ -507,6 +526,14 @@ class PortalService:
         self.tcp = tcp
         self.file_owner = file_owner  # (uid, gid) for files written as root
         self.use_real = use_real
+        self.listen_fd = listen_fd  # listening socket handed over by systemd
+        # follow_real: the game sees a portal only while a real one is plugged in. Without
+        # one, its link is closed, which the SDK reports to the game as
+        # X_ERROR_DEVICE_NOT_CONNECTED, as a 360 does when the portal is pulled out.
+        self.follow_real = follow_real
+        self.game_conns = set()
+        self.last_contact = 0.0  # monotonic time of the game's last connection attempt
+        self.told_absent = False
         self.lock = threading.RLock()
         self.emu = Emulator()
         self.virtual = set()  # slots holding figures from dumps
@@ -534,6 +561,7 @@ class PortalService:
         os.makedirs(self.library_dir, exist_ok=True)
         self.running = True
         self._restore_state()
+        self._open_real()  # before serving, so the game's first reset reaches a real portal
         self._serve()
         for fn in (self._flusher, self._real_manager):
             t = threading.Thread(target=fn, daemon=True, name=fn.__name__)
@@ -547,7 +575,7 @@ class PortalService:
                 self.server.close()
         except OSError:
             pass
-        if self.socket_path:
+        if self.socket_path and self.listen_fd is None:  # systemd owns an inherited socket
             try:
                 os.unlink(self.socket_path)
             except OSError:
@@ -566,7 +594,11 @@ class PortalService:
 
     # ----- game socket
     def _serve(self):
-        if self.tcp:
+        if self.listen_fd is not None:
+            srv = socket.socket(fileno=self.listen_fd)
+            srv.setblocking(True)
+            where = "socket from systemd (%s)" % srv.getsockname()
+        elif self.tcp:
             host, port = self.tcp.rsplit(":", 1)
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -581,7 +613,8 @@ class PortalService:
             srv.bind(self.socket_path)
             os.chmod(self.socket_path, 0o666)  # the game runs as the desktop user
             where = self.socket_path
-        srv.listen(4)
+        if self.listen_fd is None:
+            srv.listen(4)
         self.server = srv
         log.info("listening on %s", where)
         t = threading.Thread(target=self._accept_loop, daemon=True, name="accept")
@@ -603,6 +636,16 @@ class PortalService:
         if conn.family == socket.AF_INET:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with self.lock:
+            self.last_contact = time.monotonic()
+            if self.follow_real and self.real is None:
+                # No portal plugged in: refuse the link. The game retries every second.
+                if not self.told_absent:
+                    self.told_absent = True
+                    self._event("no portal plugged in: the game sees it as unplugged")
+                conn.close()
+                return
+            self.told_absent = False
+            self.game_conns.add(conn)
             self.game_clients += 1
         self._event("game connected")
         buf = b""
@@ -625,6 +668,8 @@ class PortalService:
         finally:
             conn.close()
             with self.lock:
+                self.game_conns.discard(conn)
+                self.last_contact = time.monotonic()
                 self.game_clients -= 1
             self._event("game disconnected")
 
@@ -703,28 +748,32 @@ class PortalService:
     # ----- real portal
     def _real_manager(self):
         while self.running:
-            if self.use_real and self.real is None:
-                try:
-                    portal, node = open_real_portal()
-                except OSError as e:
-                    if self.real_error != str(e):
-                        self.real_error = str(e)
-                        self._event("cannot open the portal: %s" % e)
-                    portal = None
-                if portal:
-                    with self.lock:
-                        self.real = portal
-                        self.real_queue.clear()
-                        self.real_error = ""
-                        self._event("real portal connected (%s)" % node)
-                        # Activate it right away: a portal sends status (which toys are
-                        # on it) only after Reset + Activate, and the panel should show
-                        # the toys before the game runs. The game resets it again itself.
-                        self._real_write(b"\x52")
-                        self._real_write(b"\x41\x01")
-                    threading.Thread(target=self._real_reader, args=(portal,), daemon=True,
-                                     name="real-reader").start()
+            self._open_real()
             time.sleep(1.0)
+
+    def _open_real(self):
+        """Open a plugged-in portal if there is none open yet."""
+        if self.use_real and self.real is None:
+            try:
+                portal, node = open_real_portal()
+            except OSError as e:
+                if self.real_error != str(e):
+                    self.real_error = str(e)
+                    self._event("cannot open the portal: %s" % e)
+                portal = None
+            if portal:
+                with self.lock:
+                    self.real = portal
+                    self.real_queue.clear()
+                    self.real_error = ""
+                    self._event("real portal connected (%s)" % node)
+                    # Activate it right away: a portal sends status (which toys are
+                    # on it) only after Reset + Activate, and the panel should show
+                    # the toys before the game runs. The game resets it again itself.
+                    self._real_write(b"\x52")
+                    self._real_write(b"\x41\x01")
+                threading.Thread(target=self._real_reader, args=(portal,), daemon=True,
+                                 name="real-reader").start()
 
     def _real_reader(self, portal):
         while self.running and not portal.closed:
@@ -791,6 +840,12 @@ class PortalService:
             self.real_names.clear()
             self.real_asked.clear()
             self._event("real portal disconnected (%s)" % why)
+            if self.follow_real:
+                for c in list(self.game_conns):  # tell the game the portal is gone
+                    try:
+                        c.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
 
     # ----- library / figures
     def library(self):
@@ -1111,14 +1166,29 @@ def main():
     ap.add_argument("--no-real", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--load", action="append", default=[], help="figure file to place at start")
+    ap.add_argument("--follow-real-portal", action="store_true",
+                    help="the game sees a portal only while a real one is plugged in "
+                         "(unplugging it shows as unplugged in the game)")
+    ap.add_argument("--exit-when-idle", type=float, default=0, metavar="SECONDS",
+                    help="with stdin closed: exit after this long without a game (0 = never)")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     if a.selftest:
         _selftest(a.library)
         return
     tcp = a.tcp or ("127.0.0.1:47150" if os.name == "nt" else None)
+    # systemd socket activation: the listening socket arrives as fd 3.
+    listen_fd = None
+    if os.environ.get("LISTEN_PID") == str(os.getpid()) and os.environ.get("LISTEN_FDS") == "1":
+        listen_fd = 3
     svc = PortalService(a.library, state_file=a.state, socket_path=a.socket, tcp=tcp,
-                        use_real=not a.no_real)
+                        use_real=not a.no_real, listen_fd=listen_fd,
+                        follow_real=a.follow_real_portal)
+
+    def _terminate(*_):
+        raise KeyboardInterrupt  # stop cleanly: flush dumps, give the portal back
+
+    signal.signal(signal.SIGTERM, _terminate)
     svc.start()
     for p in a.load:
         print("placed in slot", svc.load(p))
@@ -1145,9 +1215,16 @@ def main():
                 return
         except Exception as e:  # noqa: BLE001 - CLI
             print("error:", e)
-    try:  # stdin closed (run in the background): keep serving until killed
+    started = time.monotonic()
+    try:  # stdin closed (run in the background): keep serving until killed or idle
         while True:
-            time.sleep(3600)
+            time.sleep(1)
+            if a.exit_when_idle > 0 and svc.game_clients == 0:
+                # A game retrying against an unplugged portal still counts as a game.
+                idle_since = max(started, svc.last_game_io, svc.last_contact)
+                if time.monotonic() - idle_since > a.exit_when_idle:
+                    log.info("no game for %.0f s, exiting", a.exit_when_idle)
+                    break
     except KeyboardInterrupt:
         pass
     svc.stop()
