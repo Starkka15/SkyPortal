@@ -1,0 +1,12 @@
+[Unit]
+Description=SkyPortal: Portal of Power service for Skylanders SA PC
+Requires=skyportal.socket
+After=skyportal.socket
+
+[Service]
+# Started on demand by skyportal.socket when the game connects. Exits a minute after the
+# game disconnects and gives the portal back to its kernel driver (usbhid / xpad).
+# --follow-real-portal: pulling the portal out shows as unplugged in the game.
+# Adjust the path below to where this repository lives (here ~/SkyPortal).
+ExecStart=/usr/bin/python3 -I %h/SkyPortal/py_modules/skyportal.py --library %h/Skylanders --state %h/.local/state/skyportal/state.json --follow-real-portal --exit-when-idle 60
+StandardInput=null

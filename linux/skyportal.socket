@@ -1,0 +1,9 @@
+[Unit]
+Description=SkyPortal link for Skylanders SA PC (starts SkyPortal when the game connects)
+
+[Socket]
+ListenStream=/tmp/skyportal.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target
